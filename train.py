@@ -25,6 +25,7 @@ import datetime
 import os
 import time
 from typing import List
+import numpy as np
 
 import torch
 import torch.utils.data
@@ -38,6 +39,7 @@ from dataset import CocoDataset, Resizer
 import utils
 import transforms as T
 import torchvision.transforms as trsf
+from tensorboardX import SummaryWriter
 
 
 def get_dataset(image_dir, json_path, resize_dim):
@@ -73,6 +75,9 @@ def main(args):
     print(img_dim)
     dataset, num_classes = get_dataset(args.image_dir, args.train_json_path, img_dim)
     dataset_test, _ = get_dataset(args.image_dir, args.val_json_path, img_dim)
+
+    writer = SummaryWriter(logdir=args.output_dir)
+    best_map = np.NINF
 
     print("Creating data loaders")
     if args.distributed:
@@ -138,22 +143,33 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq)
+        train_one_epoch(model, optimizer, data_loader, device, epoch, args.print_freq, writer)
         lr_scheduler.step()
-        if args.output_dir:
-            utils.save_on_master(
-                {
-                    "model": model_without_ddp.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                    "args": args,
-                    "epoch": epoch,
-                },
-                os.path.join(args.output_dir, "model_{}.pth".format(epoch)),
-            )
 
         # evaluate after every epoch
-        evaluate(model, data_loader_test, device=device)
+        stats = evaluate(model, data_loader_test, device=device)
+        map_avg, map_50, map_75, map_small, map_medium, map_large = stats[:6]
+        if utils.is_main_process():
+            writer.add_scalar("eval/map@0.5:0.95", map_avg, epoch)
+            writer.add_scalar("eval/map@0.5", map_50, epoch)
+            writer.add_scalar("eval/map@0.75", map_75, epoch)
+            writer.add_scalar("eval/map_small", map_small, epoch)
+            writer.add_scalar("eval/map_medium", map_medium, epoch)
+            writer.add_scalar("eval/map_large", map_large, epoch)
+
+        if args.output_dir:
+            if map_50 > best_map:
+                utils.save_on_master(
+                    {
+                        "model": model_without_ddp.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "lr_scheduler": lr_scheduler.state_dict(),
+                        "args": args,
+                        "epoch": epoch,
+                    },
+                    os.path.join(args.output_dir, "model_{}.pth".format(epoch)),
+                )
+                best_map = map_50
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
